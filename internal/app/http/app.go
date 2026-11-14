@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,9 +22,10 @@ import (
 )
 
 const (
-	opRun     = "httpapp.Run"
-	opStop    = "httpapp.Stop"
-	apiPrefix = "/api/v1"
+	opRun         = "httpapp.Run"
+	opStop        = "httpapp.Stop"
+	apiPrefix     = "/api/v1"
+	MaxUploadSize = 5 << 20 // 5 MB
 )
 
 var (
@@ -34,6 +37,11 @@ var (
 	ErrInternalError        = "internal error"
 	ErrFailedToLogout       = "failed to logout"
 	ErrMethodNotAllowed     = "Method not allowed"
+	ErrUnauthorized         = "unauthorized"
+	ErrInvalidUserID        = "invalid user id"
+	ErrUserNotFound         = "user not found"
+	ErrFileTooBig           = "file too big"
+	ErrFailedToGetFile      = "failed to get file"
 )
 
 type App struct {
@@ -56,6 +64,10 @@ type Auth interface {
 	ValidateTokenAndGetUser(ctx context.Context, tokenString string) (models.User, error)
 	RegisterNewUser(ctx context.Context, email string, password string, name string) (userID int64, err error)
 	Logout(ctx context.Context, jti string, exp time.Time) error
+	GetProfile(ctx context.Context, userID int64) (models.User, error)
+	UpdateProfile(ctx context.Context, userID int64, name string, email string) (models.User, error)
+	ChangePassword(ctx context.Context, userID int64, currentPassword, newPassword string) error
+	UpdateAvatar(ctx context.Context, userID int64, file io.ReadSeeker, filename string) (models.User, error)
 }
 
 type Services struct {
@@ -75,16 +87,41 @@ type LoginRequest struct {
 }
 
 type LoginResponse struct {
-	UserID    int64     `json:"user_id"`
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         int64     `json:"id"`
+	UserID     int64     `json:"user_id"`
+	Email      string    `json:"email"`
+	Name       string    `json:"name"`
+	AvatarPath string    `json:"avatar_path"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type UpdateProfileRequest struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type ChangePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+type PublicUserResponse struct {
+	ID           int64     `json:"id"`
+	Name         string    `json:"name"`
+	AvatarPath   string    `json:"avatar_path"`
+	Rating       float64   `json:"rating"`
+	ReviewsCount int       `json:"reviews_count"`
+	AdsCount     int       `json:"ads_count"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type ValidationErrors struct {
-	Email    string `json:"email,omitempty"`
-	Password string `json:"password,omitempty"`
-	Name     string `json:"name,omitempty"`
+	Email           string `json:"email,omitempty"`
+	Password        string `json:"password,omitempty"`
+	Name            string `json:"name,omitempty"`
+	CurrentPassword string `json:"current_password,omitempty"`
+	NewPassword     string `json:"new_password,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 func New(
@@ -132,16 +169,27 @@ func (a *App) setAuthCookie(w http.ResponseWriter, token string) {
 }
 
 func (a *App) setupRoutes() {
+	// Публичные маршруты
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/register", a.handleRegister)
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/login", a.handleLogin)
+	a.router.HandleFunc("GET "+apiPrefix+"/ads", a.handleGetAds)
+	a.router.HandleFunc("GET "+apiPrefix+"/users/{id}", a.handleGetPublicProfile)
 
+	// Защищённые маршруты (требуют валидный JWT в куке token)
 	authMW := middleware.AuthMiddleware(a.log, a.blacklist, a.secret)
 	a.router.Handle("POST "+apiPrefix+"/auth/logout", authMW(http.HandlerFunc(a.handleLogout)))
 
+	// Маршруты профиля
+	a.router.Handle("GET "+apiPrefix+"/profile", authMW(http.HandlerFunc(a.handleGetProfile)))
+	a.router.Handle("PATCH "+apiPrefix+"/profile", authMW(http.HandlerFunc(a.handleUpdateProfile)))
+	a.router.Handle("PUT "+apiPrefix+"/profile", authMW(http.HandlerFunc(a.handleUpdateProfile)))
+	a.router.Handle("POST "+apiPrefix+"/profile/password", authMW(http.HandlerFunc(a.handleChangePassword)))
+	a.router.Handle("PATCH "+apiPrefix+"/profile/password", authMW(http.HandlerFunc(a.handleChangePassword)))
+	a.router.Handle("POST "+apiPrefix+"/profile/avatar", authMW(http.HandlerFunc(a.handleUploadAvatar)))
+
+	// Раздача статики (картинки объявлений и аватарки)
 	fs := http.FileServer(http.Dir("static"))
 	a.router.Handle("/static/", http.StripPrefix("/static/", fs))
-
-	a.router.HandleFunc("GET "+apiPrefix+"/ads", a.handleGetAds)
 }
 
 func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -267,10 +315,12 @@ func (a *App) handleTokenLogin(w http.ResponseWriter, r *http.Request, tokenStri
 
 func (a *App) respondWithUser(w http.ResponseWriter, userID int64, user models.User) {
 	responser.RespondWithJSON(w, http.StatusOK, LoginResponse{
-		UserID:    userID,
-		Email:     user.Email,
-		Name:      user.Name,
-		CreatedAt: user.CreatedAt,
+		ID:         userID,
+		UserID:     userID,
+		Email:      user.Email,
+		Name:       user.Name,
+		AvatarPath: user.AvatarPath,
+		CreatedAt:  user.CreatedAt,
 	})
 }
 
@@ -296,6 +346,199 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	})
 
 	responser.RespondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *App) handleGetProfile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(middleware.UserIDKey).(int64)
+	if !ok {
+		responser.RespondWithError(w, http.StatusUnauthorized, ErrUnauthorized)
+		return
+	}
+
+	user, err := a.services.Auth.GetProfile(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserNotFound) {
+			responser.RespondWithError(w, http.StatusNotFound, ErrUserNotFound)
+			return
+		}
+		a.log.Error("failed to get profile", slog.String("error", err.Error()))
+		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
+		return
+	}
+
+	responser.RespondWithJSON(w, http.StatusOK, user)
+}
+
+func (a *App) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(middleware.UserIDKey).(int64)
+	if !ok {
+		responser.RespondWithError(w, http.StatusUnauthorized, ErrUnauthorized)
+		return
+	}
+
+	var req UpdateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrInvalidRequestBody)
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+
+	if req.Name == "" && req.Email == "" {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrInvalidRequestBody)
+		return
+	}
+
+	validationErrors := ValidationErrors{}
+	if req.Name != "" {
+		if err := validator.ValidateName(req.Name); err != nil {
+			validationErrors.Name = err.Error()
+		}
+	}
+	if req.Email != "" {
+		if err := validator.ValidateEmail(req.Email); err != nil {
+			validationErrors.Email = err.Error()
+		}
+	}
+
+	if validationErrors.Name != "" || validationErrors.Email != "" {
+		responser.RespondWithJSON(w, http.StatusBadRequest, validationErrors)
+		return
+	}
+
+	updatedUser, err := a.services.Auth.UpdateProfile(r.Context(), userID, req.Name, req.Email)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserExists) {
+			responser.RespondWithJSON(w, http.StatusBadRequest, ValidationErrors{
+				Email: ErrUserAlreadyExists,
+				Error: ErrUserAlreadyExists,
+			})
+			return
+		}
+		if errors.Is(err, storage.ErrUserNotFound) {
+			responser.RespondWithError(w, http.StatusNotFound, ErrUserNotFound)
+			return
+		}
+		a.log.Error("failed to update profile", slog.String("error", err.Error()))
+		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
+		return
+	}
+
+	responser.RespondWithJSON(w, http.StatusOK, updatedUser)
+}
+
+func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(middleware.UserIDKey).(int64)
+	if !ok {
+		responser.RespondWithError(w, http.StatusUnauthorized, ErrUnauthorized)
+		return
+	}
+
+	var req ChangePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrInvalidRequestBody)
+		return
+	}
+
+	validationErrors := ValidationErrors{}
+	if req.CurrentPassword == "" {
+		validationErrors.CurrentPassword = "current password is required"
+	}
+	if err := validator.ValidatePassword(req.NewPassword); err != nil {
+		validationErrors.NewPassword = err.Error()
+	}
+
+	if validationErrors.CurrentPassword != "" || validationErrors.NewPassword != "" {
+		responser.RespondWithJSON(w, http.StatusBadRequest, validationErrors)
+		return
+	}
+
+	if err := a.services.Auth.ChangePassword(r.Context(), userID, req.CurrentPassword, req.NewPassword); err != nil {
+		if errors.Is(err, auth.ErrInvalidCurrentPassword) {
+			responser.RespondWithJSON(w, http.StatusBadRequest, ValidationErrors{
+				CurrentPassword: err.Error(),
+				Error:           err.Error(),
+			})
+			return
+		}
+		if errors.Is(err, auth.ErrSamePassword) {
+			responser.RespondWithJSON(w, http.StatusBadRequest, ValidationErrors{
+				NewPassword: err.Error(),
+				Error:       err.Error(),
+			})
+			return
+		}
+		a.log.Error("failed to change password", slog.String("error", err.Error()))
+		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
+		return
+	}
+
+	responser.RespondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *App) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := r.Context().Value(middleware.UserIDKey).(int64)
+	if !ok {
+		responser.RespondWithError(w, http.StatusUnauthorized, ErrUnauthorized)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize)
+	if err := r.ParseMultipartForm(MaxUploadSize); err != nil {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrFileTooBig)
+		return
+	}
+
+	file, header, err := r.FormFile("avatar")
+	if err != nil {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrFailedToGetFile)
+		return
+	}
+	defer file.Close()
+
+	updatedUser, err := a.services.Auth.UpdateAvatar(r.Context(), userID, file, header.Filename)
+	if err != nil {
+		if errors.Is(err, auth.ErrUnsupportedFileType) {
+			responser.RespondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.log.Error("failed to update avatar", slog.String("error", err.Error()))
+		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
+		return
+	}
+
+	responser.RespondWithJSON(w, http.StatusOK, updatedUser)
+}
+
+func (a *App) handleGetPublicProfile(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	userID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || userID <= 0 {
+		responser.RespondWithError(w, http.StatusBadRequest, ErrInvalidUserID)
+		return
+	}
+
+	user, err := a.services.Auth.GetProfile(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserNotFound) {
+			responser.RespondWithError(w, http.StatusNotFound, ErrUserNotFound)
+			return
+		}
+		a.log.Error("failed to get public profile", slog.String("error", err.Error()))
+		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
+		return
+	}
+
+	responser.RespondWithJSON(w, http.StatusOK, PublicUserResponse{
+		ID:           user.ID,
+		Name:         user.Name,
+		AvatarPath:   user.AvatarPath,
+		Rating:       user.Rating,
+		ReviewsCount: user.ReviewsCount,
+		AdsCount:     user.AdsCount,
+		CreatedAt:    user.CreatedAt,
+	})
 }
 
 func (a *App) handleGetAds(w http.ResponseWriter, r *http.Request) {
