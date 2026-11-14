@@ -4,7 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"lavka/internal/domain/models"
@@ -14,6 +19,13 @@ import (
 	jwtlib "github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
+
+var allowedAvatarTypes = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/png":  ".png",
+	"image/webp": ".webp",
+	"image/gif":  ".gif",
+}
 
 type TokenRevoker interface {
 	Add(jti string, exp time.Time)
@@ -25,6 +37,9 @@ type UserProviderSaver interface {
 	User(ctx context.Context, email string) (models.User, error)
 	UserByID(ctx context.Context, userID int64) (models.User, error)
 	IsAdmin(ctx context.Context, userID int64) (bool, error)
+	UpdateUser(ctx context.Context, userID int64, name string, email string) (models.User, error)
+	UpdatePassword(ctx context.Context, userID int64, passHash []byte) error
+	UpdateAvatarPath(ctx context.Context, userID int64, avatarPath string) (models.User, error)
 }
 
 type Auth struct {
@@ -36,8 +51,11 @@ type Auth struct {
 }
 
 var (
-	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrTokenRevoked       = errors.New("token has been revoked")
+	ErrInvalidCredentials     = errors.New("invalid credentials")
+	ErrTokenRevoked           = errors.New("token has been revoked")
+	ErrInvalidCurrentPassword = errors.New("invalid current password")
+	ErrSamePassword           = errors.New("new password must be different")
+	ErrUnsupportedFileType    = errors.New("unsupported file type")
 )
 
 func New(
@@ -149,4 +167,113 @@ func (a *Auth) ValidateTokenAndGetUser(ctx context.Context, tokenString string) 
 func (a *Auth) Logout(ctx context.Context, jti string, exp time.Time) error {
 	a.tokenRevoker.Add(jti, exp)
 	return nil
+}
+
+func (a *Auth) GetProfile(ctx context.Context, userID int64) (models.User, error) {
+	const op = "auth.GetProfile"
+	user, err := a.userStorage.UserByID(ctx, userID)
+	if err != nil {
+		return models.User{}, fmt.Errorf("%s: %w", op, err)
+	}
+	return user, nil
+}
+
+func (a *Auth) UpdateProfile(ctx context.Context, userID int64, name string, email string) (models.User, error) {
+	const op = "auth.UpdateProfile"
+	user, err := a.userStorage.UpdateUser(ctx, userID, name, email)
+	if err != nil {
+		return models.User{}, fmt.Errorf("%s: %w", op, err)
+	}
+	return user, nil
+}
+
+func (a *Auth) ChangePassword(ctx context.Context, userID int64, currentPassword, newPassword string) error {
+	const op = "auth.ChangePassword"
+
+	user, err := a.userStorage.UserByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	if err := bcrypt.CompareHashAndPassword(user.PassHash, []byte(currentPassword)); err != nil {
+		return ErrInvalidCurrentPassword
+	}
+
+	if currentPassword == newPassword {
+		return ErrSamePassword
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	if err := a.userStorage.UpdatePassword(ctx, userID, newHash); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	return nil
+}
+
+func (a *Auth) UpdateAvatar(ctx context.Context, userID int64, file io.ReadSeeker, filename string) (models.User, error) {
+	const op = "auth.UpdateAvatar"
+
+	buff := make([]byte, 512)
+	n, err := file.Read(buff)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return models.User{}, fmt.Errorf("%s: failed to read file header: %w", op, err)
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return models.User{}, fmt.Errorf("%s: failed to seek file: %w", op, err)
+	}
+
+	contentType := http.DetectContentType(buff[:n])
+	defaultExt, ok := allowedAvatarTypes[contentType]
+	if !ok {
+		return models.User{}, ErrUnsupportedFileType
+	}
+
+	currentUser, err := a.userStorage.UserByID(ctx, userID)
+	if err != nil {
+		return models.User{}, fmt.Errorf("%s: %w", op, err)
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".gif" {
+		ext = defaultExt
+	}
+
+	newFileName := fmt.Sprintf("%d_%d%s", userID, time.Now().UnixNano(), ext)
+	storageDir := filepath.Join("static", "img", "avatars")
+	storagePath := filepath.Join(storageDir, newFileName)
+	dbPath := "/static/img/avatars/" + newFileName
+
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		return models.User{}, fmt.Errorf("%s: failed to create avatar dir: %w", op, err)
+	}
+
+	dst, err := os.Create(storagePath)
+	if err != nil {
+		return models.User{}, fmt.Errorf("%s: failed to create file: %w", op, err)
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		_ = os.Remove(storagePath)
+		return models.User{}, fmt.Errorf("%s: failed to copy file: %w", op, err)
+	}
+
+	updatedUser, err := a.userStorage.UpdateAvatarPath(ctx, userID, dbPath)
+	if err != nil {
+		_ = os.Remove(storagePath)
+		return models.User{}, fmt.Errorf("%s: %w", op, err)
+	}
+
+	if strings.HasPrefix(currentUser.AvatarPath, "/static/img/avatars/") {
+		oldFilePath := filepath.Clean(strings.TrimPrefix(currentUser.AvatarPath, "/"))
+		_ = os.Remove(oldFilePath)
+	}
+
+	return updatedUser, nil
 }

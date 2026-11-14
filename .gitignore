@@ -1,5 +1,6 @@
 .env
-bin/
-storage/
+/bin/
+/storage/
+/static/img/avatars/
 coverage.out
 coverage.html
