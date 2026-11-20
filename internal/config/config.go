@@ -12,6 +12,7 @@ import (
 type Config struct {
 	Env             string
 	StoragePath     string
+	DatabaseURL     string
 	TokenTTL        time.Duration
 	HTTP            HTTPConfig
 	CleanupInterval time.Duration
@@ -64,6 +65,7 @@ func MustLoadByPath(path string) *Config {
 	return &Config{
 		Env:             rawConfig.Env,
 		StoragePath:     rawConfig.StoragePath,
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		TokenTTL:        parseDuration(rawConfig.TokenTTL, "token_ttl"),
 		HTTP:            rawConfig.HTTP,
 		CleanupInterval: parseDuration(rawConfig.CleanupInterval, "cleanup_interval"),

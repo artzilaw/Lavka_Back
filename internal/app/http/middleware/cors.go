@@ -24,7 +24,8 @@ func CORSMiddleware(next http.Handler) http.Handler {
 
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Origin, Accept")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Origin, Accept, X-CSRF-Token, X-Request-ID")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {

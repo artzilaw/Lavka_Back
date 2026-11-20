@@ -57,6 +57,28 @@ type App struct {
 
 type Ads interface {
 	GetAll() []models.Ad
+	GetByID(id int64) (models.Ad, error)
+	IncrementViews(id int64) (models.Ad, error)
+	GetBySellerID(sellerID int64, includeClosed bool) []models.Ad
+	CountBySeller(sellerID int64) (active int, closed int)
+	Create(ad models.Ad) (models.Ad, error)
+	Update(id int64, sellerID int64, patch models.Ad) (models.Ad, error)
+	Close(id int64, sellerID int64) (models.Ad, error)
+	Reopen(id int64, sellerID int64) (models.Ad, error)
+	MarkSold(ids []int64) error
+	Delete(id int64, sellerID int64) error
+}
+
+type Cart interface {
+	GetCart(userID int64) []models.CartItem
+	CountItems(userID int64) int
+	AddItem(userID, adID int64, quantity int) ([]models.CartItem, error)
+	UpdateItemQuantity(userID, adID int64, quantity int) ([]models.CartItem, error)
+	RemoveItem(userID, adID int64) ([]models.CartItem, error)
+	RemoveAdFromAllCarts(adID int64) error
+	ClearCart(userID int64) error
+	CreateOrder(order models.Order) (models.Order, error)
+	GetOrdersByBuyer(buyerID int64) []models.Order
 }
 
 type Auth interface {
@@ -73,6 +95,7 @@ type Auth interface {
 type Services struct {
 	Ads  Ads
 	Auth Auth
+	Cart Cart
 }
 
 type RegisterRequest struct {
@@ -144,11 +167,15 @@ func New(
 
 	app.setupRoutes()
 
-	handlerWithCORS := middleware.CORSMiddleware(app.router)
+	handler := middleware.CORSMiddleware(
+		middleware.AccessLogMiddleware(log)(
+			middleware.CSRFMiddleware(app.router),
+		),
+	)
 
 	app.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      handlerWithCORS,
+		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -170,10 +197,13 @@ func (a *App) setAuthCookie(w http.ResponseWriter, token string) {
 
 func (a *App) setupRoutes() {
 	// Публичные маршруты
+	a.router.HandleFunc("GET "+apiPrefix+"/csrf", a.handleGetCSRFToken)
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/register", a.handleRegister)
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/login", a.handleLogin)
 	a.router.HandleFunc("GET "+apiPrefix+"/ads", a.handleGetAds)
+	a.router.HandleFunc("GET "+apiPrefix+"/ads/{id}", a.handleGetAdByID)
 	a.router.HandleFunc("GET "+apiPrefix+"/users/{id}", a.handleGetPublicProfile)
+	a.router.HandleFunc("GET "+apiPrefix+"/sellers/{id}", a.handleGetSellerPage)
 
 	// Защищённые маршруты (требуют валидный JWT в куке token)
 	authMW := middleware.AuthMiddleware(a.log, a.blacklist, a.secret)
@@ -187,9 +217,33 @@ func (a *App) setupRoutes() {
 	a.router.Handle("PATCH "+apiPrefix+"/profile/password", authMW(http.HandlerFunc(a.handleChangePassword)))
 	a.router.Handle("POST "+apiPrefix+"/profile/avatar", authMW(http.HandlerFunc(a.handleUploadAvatar)))
 
+	// Маршруты объявлений (создание, изменение, закрытие, переоткрытие, удаление, загрузка фото)
+	a.router.Handle("GET "+apiPrefix+"/my/ads", authMW(http.HandlerFunc(a.handleGetMyAds)))
+	a.router.Handle("POST "+apiPrefix+"/ads", authMW(http.HandlerFunc(a.handleCreateAd)))
+	a.router.Handle("POST "+apiPrefix+"/ads/photos", authMW(http.HandlerFunc(a.handleUploadAdPhoto)))
+	a.router.Handle("PUT "+apiPrefix+"/ads/{id}", authMW(http.HandlerFunc(a.handleUpdateAd)))
+	a.router.Handle("PATCH "+apiPrefix+"/ads/{id}", authMW(http.HandlerFunc(a.handleUpdateAd)))
+	a.router.Handle("POST "+apiPrefix+"/ads/{id}/close", authMW(http.HandlerFunc(a.handleCloseAd)))
+	a.router.Handle("POST "+apiPrefix+"/ads/{id}/reopen", authMW(http.HandlerFunc(a.handleReopenAd)))
+	a.router.Handle("DELETE "+apiPrefix+"/ads/{id}", authMW(http.HandlerFunc(a.handleDeleteAd)))
+
+	// Маршруты корзины и оформления покупки
+	a.router.Handle("GET "+apiPrefix+"/cart", authMW(http.HandlerFunc(a.handleGetCart)))
+	a.router.Handle("POST "+apiPrefix+"/cart/items", authMW(http.HandlerFunc(a.handleAddCartItem)))
+	a.router.Handle("PATCH "+apiPrefix+"/cart/items/{adId}", authMW(http.HandlerFunc(a.handleUpdateCartItem)))
+	a.router.Handle("DELETE "+apiPrefix+"/cart/items/{adId}", authMW(http.HandlerFunc(a.handleRemoveCartItem)))
+	a.router.Handle("DELETE "+apiPrefix+"/cart", authMW(http.HandlerFunc(a.handleClearCart)))
+	a.router.Handle("POST "+apiPrefix+"/cart/checkout", authMW(http.HandlerFunc(a.handleCheckout)))
+	a.router.Handle("GET "+apiPrefix+"/orders", authMW(http.HandlerFunc(a.handleGetOrders)))
+
 	// Раздача статики (картинки объявлений и аватарки)
 	fs := http.FileServer(http.Dir("static"))
 	a.router.Handle("/static/", http.StripPrefix("/static/", fs))
+}
+
+func (a *App) handleGetCSRFToken(w http.ResponseWriter, r *http.Request) {
+	token := middleware.EnsureCSRFCookie(w, r)
+	responser.RespondWithJSON(w, http.StatusOK, map[string]string{"csrf_token": token})
 }
 
 func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +418,14 @@ func (a *App) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 		a.log.Error("failed to get profile", slog.String("error", err.Error()))
 		responser.RespondWithError(w, http.StatusInternalServerError, ErrInternalError)
 		return
+	}
+
+	if a.services.Ads != nil {
+		active, closed := a.services.Ads.CountBySeller(userID)
+		user.AdsCount = active + closed
+	}
+	if a.services.Cart != nil {
+		user.CartCount = a.services.Cart.CountItems(userID)
 	}
 
 	responser.RespondWithJSON(w, http.StatusOK, user)
