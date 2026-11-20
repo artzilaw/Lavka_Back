@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lavka/internal/domain/models"
+	"lavka/internal/logger"
 	"lavka/internal/pkg/jwt"
 	"lavka/internal/storage"
 
@@ -77,7 +78,7 @@ func New(
 func (a *Auth) RegisterNewUser(ctx context.Context, email, password, name string) (int64, error) {
 	const op = "auth.RegisterNewUser"
 
-	log := a.log.With(slog.String("op", op), slog.String("email", email))
+	log := logger.FromContext(ctx, a.log).With(slog.String("op", op), slog.String("email", email))
 	log.Info("registering user")
 
 	passHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -101,7 +102,7 @@ func (a *Auth) RegisterNewUser(ctx context.Context, email, password, name string
 }
 
 func (a *Auth) Login(ctx context.Context, email, password string) (string, models.User, error) {
-	log := a.log.With(slog.String("email", email))
+	log := logger.FromContext(ctx, a.log).With(slog.String("email", email))
 	log.Info("logging in user")
 
 	user, err := a.userStorage.User(ctx, email)

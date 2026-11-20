@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"lavka/internal/app/http/middleware"
 	"lavka/internal/services/auth"
 	"lavka/internal/storage"
 	"lavka/internal/storage/ads"
@@ -66,11 +67,27 @@ func TestHTTP_RegisterLoginProfileAdsLogout(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("expected auth cookie after register")
 	}
-	authCookie := cookies[0]
+	var authCookie, csrfCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "token" {
+			authCookie = c
+		}
+		if c.Name == middleware.CSRFCookieName {
+			csrfCookie = c
+		}
+	}
+	if authCookie == nil || csrfCookie == nil {
+		t.Fatalf("expected token and csrf_token cookies, got %+v", cookies)
+	}
+	withSession := func(req *http.Request) {
+		req.AddCookie(authCookie)
+		req.AddCookie(csrfCookie)
+		req.Header.Set(middleware.CSRFHeaderName, csrfCookie.Value)
+	}
 
 	// 4. GET /api/v1/profile
 	reqProf := httptest.NewRequest(http.MethodGet, "/api/v1/profile", nil)
-	reqProf.AddCookie(authCookie)
+	withSession(reqProf)
 	recProf := httptest.NewRecorder()
 	app.srv.Handler.ServeHTTP(recProf, reqProf)
 	if recProf.Code != http.StatusOK {
@@ -80,7 +97,7 @@ func TestHTTP_RegisterLoginProfileAdsLogout(t *testing.T) {
 	// 5. PATCH /api/v1/profile (обновление имени и почты)
 	updBody := []byte(`{"name":"UpdatedName","email":"updated@lavka.ru"}`)
 	reqUpd := httptest.NewRequest(http.MethodPatch, "/api/v1/profile", bytes.NewReader(updBody))
-	reqUpd.AddCookie(authCookie)
+	withSession(reqUpd)
 	recUpd := httptest.NewRecorder()
 	app.srv.Handler.ServeHTTP(recUpd, reqUpd)
 	if recUpd.Code != http.StatusOK {
@@ -90,7 +107,7 @@ func TestHTTP_RegisterLoginProfileAdsLogout(t *testing.T) {
 	// 6. POST /api/v1/profile/password (смена пароля)
 	pwdBody := []byte(`{"current_password":"Password123","new_password":"NewPassword456"}`)
 	reqPwd := httptest.NewRequest(http.MethodPost, "/api/v1/profile/password", bytes.NewReader(pwdBody))
-	reqPwd.AddCookie(authCookie)
+	withSession(reqPwd)
 	recPwd := httptest.NewRecorder()
 	app.srv.Handler.ServeHTTP(recPwd, reqPwd)
 	if recPwd.Code != http.StatusOK {
@@ -106,7 +123,7 @@ func TestHTTP_RegisterLoginProfileAdsLogout(t *testing.T) {
 
 	reqAvatar := httptest.NewRequest(http.MethodPost, "/api/v1/profile/avatar", &bodyBuf)
 	reqAvatar.Header.Set("Content-Type", mw.FormDataContentType())
-	reqAvatar.AddCookie(authCookie)
+	withSession(reqAvatar)
 	recAvatar := httptest.NewRecorder()
 	app.srv.Handler.ServeHTTP(recAvatar, reqAvatar)
 	if recAvatar.Code != http.StatusOK {
@@ -132,7 +149,7 @@ func TestHTTP_RegisterLoginProfileAdsLogout(t *testing.T) {
 
 	// 10. POST /api/v1/auth/logout
 	reqLogout := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
-	reqLogout.AddCookie(authCookie)
+	withSession(reqLogout)
 	recLogout := httptest.NewRecorder()
 	app.srv.Handler.ServeHTTP(recLogout, reqLogout)
 	if recLogout.Code != http.StatusOK {

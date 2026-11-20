@@ -2,6 +2,13 @@ package models
 
 import "time"
 
+const (
+	AdStatusActive  = "active"
+	AdStatusClosed  = "closed"
+	AdStatusSold    = "sold"
+	AdStatusDeleted = "deleted"
+)
+
 type Ad struct {
 	ID             int64     `json:"id"`
 	SellerID       int64     `json:"seller_id"`
@@ -14,7 +21,7 @@ type Ad struct {
 	FavoritesCount int64     `json:"favorites_count"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
-	DeletedAt      time.Time `json:"deleted_at"`
+	DeletedAt      time.Time `json:"deleted_at,omitempty"`
 	Photos         []string  `json:"photos"`
 	Location       string    `json:"location"`
 }

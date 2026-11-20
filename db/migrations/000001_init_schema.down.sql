@@ -1,0 +1,13 @@
+-- 000001_init_schema.down.sql
+
+BEGIN;
+
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS cart_items;
+DROP TABLE IF EXISTS ad_photos;
+DROP TABLE IF EXISTS ads;
+DROP TABLE IF EXISTS categories;
+DROP TABLE IF EXISTS users;
+
+COMMIT;

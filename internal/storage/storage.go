@@ -41,6 +41,7 @@ func New(path string) (*Storage, error) {
 	}
 
 	if path == "" {
+		s.seedDefaultSellers()
 		return s, nil
 	}
 
@@ -59,7 +60,36 @@ func New(path string) (*Storage, error) {
 		return nil, err
 	}
 
+	s.seedDefaultSellers()
+
 	return s, nil
+}
+
+func (s *Storage) seedDefaultSellers() {
+	now := time.Now()
+	defaults := []models.User{
+		{ID: 101, Name: "Алексей Смирнов", Email: "seller101@lavka.ru", Rating: 4.9, ReviewsCount: 28, CreatedAt: now.Add(-365 * 24 * time.Hour)},
+		{ID: 102, Name: "Мария Иванова", Email: "seller102@lavka.ru", Rating: 4.7, ReviewsCount: 15, CreatedAt: now.Add(-240 * 24 * time.Hour)},
+		{ID: 103, Name: "Дмитрий Кузнецов", Email: "seller103@lavka.ru", Rating: 4.8, ReviewsCount: 19, CreatedAt: now.Add(-180 * 24 * time.Hour)},
+		{ID: 104, Name: "Елена Соколова", Email: "seller104@lavka.ru", Rating: 5.0, ReviewsCount: 41, CreatedAt: now.Add(-420 * 24 * time.Hour)},
+		{ID: 105, Name: "Артём Волков", Email: "seller105@lavka.ru", Rating: 4.9, ReviewsCount: 64, CreatedAt: now.Add(-510 * 24 * time.Hour)},
+		{ID: 106, Name: "Ольга Морозова", Email: "seller106@lavka.ru", Rating: 4.6, ReviewsCount: 11, CreatedAt: now.Add(-150 * 24 * time.Hour)},
+		{ID: 107, Name: "Никита Павлов", Email: "seller107@lavka.ru", Rating: 4.9, ReviewsCount: 33, CreatedAt: now.Add(-300 * 24 * time.Hour)},
+		{ID: 108, Name: "Сергей Новиков", Email: "seller108@lavka.ru", Rating: 4.8, ReviewsCount: 22, CreatedAt: now.Add(-210 * 24 * time.Hour)},
+		{ID: 109, Name: "Максим Фёдоров", Email: "seller109@lavka.ru", Rating: 5.0, ReviewsCount: 52, CreatedAt: now.Add(-460 * 24 * time.Hour)},
+		{ID: 110, Name: "Зарина Алиева", Email: "seller110@lavka.ru", Rating: 4.8, ReviewsCount: 17, CreatedAt: now.Add(-280 * 24 * time.Hour)},
+		{ID: 111, Name: "Игорь Петров", Email: "seller111@lavka.ru", Rating: 4.7, ReviewsCount: 9, CreatedAt: now.Add(-120 * 24 * time.Hour)},
+		{ID: 112, Name: "Анна Козлова", Email: "seller112@lavka.ru", Rating: 4.9, ReviewsCount: 27, CreatedAt: now.Add(-330 * 24 * time.Hour)},
+	}
+
+	for _, u := range defaults {
+		if _, exists := s.usersByID[u.ID]; !exists {
+			s.usersByID[u.ID] = u
+			if _, emailExists := s.usersByEmail[u.Email]; !emailExists {
+				s.usersByEmail[u.Email] = u
+			}
+		}
+	}
 }
 
 func (s *Storage) load() error {
@@ -131,7 +161,12 @@ func (s *Storage) SaveUser(ctx context.Context, email string, passHash []byte, n
 		return 0, ErrUserExists
 	}
 
-	s.nextUserID++
+	for {
+		s.nextUserID++
+		if _, occupied := s.usersByID[s.nextUserID]; !occupied {
+			break
+		}
+	}
 	now := time.Now()
 	u := models.User{
 		ID:        s.nextUserID,
