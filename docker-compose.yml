@@ -1,0 +1,148 @@
+name: lavka
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lavka-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lavka}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lavka_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-lavka}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
+      - ./db/migrations/000002_seed_initial_data.up.sql:/docker-entrypoint-initdb.d/02_seed_categories.sql:ro
+      - ./db/migrations/000003_favorites.up.sql:/docker-entrypoint-initdb.d/03_favorites.sql:ro
+      - ./db/migrations/000004_rk4_promotion_and_price_history.up.sql:/docker-entrypoint-initdb.d/04_rk4_promotion.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lavka} -d ${POSTGRES_DB:-lavka}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lavka-auth-service
+    restart: unless-stopped
+    command: ["./lavka-auth", "--config=./config/local.json"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TOKEN_SECRET: ${TOKEN_SECRET:-my-super-secret-jwt-key}
+      CONFIG_PATH: ./config/local.json
+      DATABASE_URL: postgres://${POSTGRES_USER:-lavka}:${POSTGRES_PASSWORD:-lavka_pass}@postgres:5432/${POSTGRES_DB:-lavka}?sslmode=disable
+      GRPC_PORT: "50051"
+      METRICS_PORT: "9091"
+    ports:
+      - "50051:50051"
+      - "9091:9091"
+    volumes:
+      - ./static:/app/static
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lavka-catalog-service
+    restart: unless-stopped
+    command: ["./lavka-catalog", "--config=./config/local.json"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TOKEN_SECRET: ${TOKEN_SECRET:-my-super-secret-jwt-key}
+      CONFIG_PATH: ./config/local.json
+      DATABASE_URL: postgres://${POSTGRES_USER:-lavka}:${POSTGRES_PASSWORD:-lavka_pass}@postgres:5432/${POSTGRES_DB:-lavka}?sslmode=disable
+      GRPC_PORT: "50052"
+      METRICS_PORT: "9092"
+    ports:
+      - "50052:50052"
+      - "9092:9092"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lavka-backend
+    restart: unless-stopped
+    command: ["./lavka-server", "--config=./config/local.json"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+      catalog-service:
+        condition: service_started
+    environment:
+      TOKEN_SECRET: ${TOKEN_SECRET:-my-super-secret-jwt-key}
+      CONFIG_PATH: ./config/local.json
+      DATABASE_URL: postgres://${POSTGRES_USER:-lavka}:${POSTGRES_PASSWORD:-lavka_pass}@postgres:5432/${POSTGRES_DB:-lavka}?sslmode=disable
+      AUTH_GRPC_ADDR: auth-service:50051
+      CATALOG_GRPC_ADDR: catalog-service:50052
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./static:/app/static
+
+  frontend:
+    build:
+      context: ../Frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/v1
+        VITE_MEDIA_BASE_URL: ""
+    container_name: lavka-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: lavka-prometheus
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - auth-service
+      - catalog-service
+      - node-exporter
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: lavka-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: lavka-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  pg_data:
+  prom_data:
+  grafana_data:

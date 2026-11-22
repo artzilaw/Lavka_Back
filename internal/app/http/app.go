@@ -18,7 +18,6 @@ import (
 	"lavka/internal/pkg/validator"
 	"lavka/internal/services/auth"
 	"lavka/internal/storage"
-	"lavka/internal/storage/blacklist"
 )
 
 const (
@@ -49,14 +48,17 @@ type App struct {
 	router    *http.ServeMux
 	port      int
 	srv       *http.Server
-	services  Services
-	blacklist *blacklist.InMemory
-	tokenTTL  time.Duration
-	secret    string
+	services    Services
+	blacklist   middleware.TokenChecker
+	metrics     *middleware.MetricsRegistry
+	viewTracker *viewTracker
+	tokenTTL    time.Duration
+	secret      string
 }
 
 type Ads interface {
 	GetAll() []models.Ad
+	Search(filter models.AdFilter) []models.Ad
 	GetByID(id int64) (models.Ad, error)
 	IncrementViews(id int64) (models.Ad, error)
 	GetBySellerID(sellerID int64, includeClosed bool) []models.Ad
@@ -67,6 +69,22 @@ type Ads interface {
 	Reopen(id int64, sellerID int64) (models.Ad, error)
 	MarkSold(ids []int64) error
 	Delete(id int64, sellerID int64) error
+	GetPriceHistory(adID int64) []models.PriceHistoryItem
+	Promote(id int64, sellerID int64, tier string, priority int, until time.Time) (models.Ad, error)
+}
+
+type Wallet interface {
+	GetBalance(userID int64) (int64, error)
+	ListTransactions(userID int64) ([]models.WalletTransaction, error)
+	TopUp(userID int64, amount int64, description string) (int64, models.WalletTransaction, error)
+	Charge(userID int64, amount int64, description string) (int64, models.WalletTransaction, error)
+}
+
+type Favorites interface {
+	Add(userID, adID int64) (int64, error)
+	Remove(userID, adID int64) (int64, error)
+	ListAdIDs(userID int64) []int64
+	CountByUser(userID int64) int
 }
 
 type Cart interface {
@@ -93,9 +111,11 @@ type Auth interface {
 }
 
 type Services struct {
-	Ads  Ads
-	Auth Auth
-	Cart Cart
+	Ads       Ads
+	Auth      Auth
+	Cart      Cart
+	Favorites Favorites
+	Wallet    Wallet
 }
 
 type RegisterRequest struct {
@@ -150,7 +170,7 @@ type ValidationErrors struct {
 func New(
 	log *slog.Logger,
 	services Services,
-	bl *blacklist.InMemory,
+	bl middleware.TokenChecker,
 	port int,
 	tokenTTL time.Duration,
 	secret string,
@@ -161,15 +181,19 @@ func New(
 		port:      port,
 		services:  services,
 		tokenTTL:  tokenTTL,
-		blacklist: bl,
-		secret:    secret,
+		blacklist:   bl,
+		metrics:     middleware.NewMetricsRegistry(),
+		viewTracker: newViewTracker(10 * time.Minute),
+		secret:      secret,
 	}
 
 	app.setupRoutes()
 
 	handler := middleware.CORSMiddleware(
-		middleware.AccessLogMiddleware(log)(
-			middleware.CSRFMiddleware(app.router),
+		app.metrics.Middleware(
+			middleware.AccessLogMiddleware(log)(
+				middleware.CSRFMiddleware(app.router),
+			),
 		),
 	)
 
@@ -196,12 +220,20 @@ func (a *App) setAuthCookie(w http.ResponseWriter, token string) {
 }
 
 func (a *App) setupRoutes() {
+	// Метрики Prometheus и healthcheck
+	a.router.Handle("GET /metrics", a.metrics)
+	a.router.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		responser.RespondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
 	// Публичные маршруты
 	a.router.HandleFunc("GET "+apiPrefix+"/csrf", a.handleGetCSRFToken)
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/register", a.handleRegister)
 	a.router.HandleFunc("POST "+apiPrefix+"/auth/login", a.handleLogin)
 	a.router.HandleFunc("GET "+apiPrefix+"/ads", a.handleGetAds)
 	a.router.HandleFunc("GET "+apiPrefix+"/ads/{id}", a.handleGetAdByID)
+	a.router.HandleFunc("GET "+apiPrefix+"/ads/{id}/price-history", a.handleGetPriceHistory)
+	a.router.HandleFunc("GET "+apiPrefix+"/promotion/tariffs", a.handleGetPromotionTariffs)
 	a.router.HandleFunc("GET "+apiPrefix+"/users/{id}", a.handleGetPublicProfile)
 	a.router.HandleFunc("GET "+apiPrefix+"/sellers/{id}", a.handleGetSellerPage)
 
@@ -225,6 +257,9 @@ func (a *App) setupRoutes() {
 	a.router.Handle("PATCH "+apiPrefix+"/ads/{id}", authMW(http.HandlerFunc(a.handleUpdateAd)))
 	a.router.Handle("POST "+apiPrefix+"/ads/{id}/close", authMW(http.HandlerFunc(a.handleCloseAd)))
 	a.router.Handle("POST "+apiPrefix+"/ads/{id}/reopen", authMW(http.HandlerFunc(a.handleReopenAd)))
+	a.router.Handle("POST "+apiPrefix+"/ads/{id}/promote", authMW(http.HandlerFunc(a.handlePromoteAd)))
+	a.router.Handle("GET "+apiPrefix+"/wallet", authMW(http.HandlerFunc(a.handleGetWallet)))
+	a.router.Handle("POST "+apiPrefix+"/wallet/topup", authMW(http.HandlerFunc(a.handleWalletTopUp)))
 	a.router.Handle("DELETE "+apiPrefix+"/ads/{id}", authMW(http.HandlerFunc(a.handleDeleteAd)))
 
 	// Маршруты корзины и оформления покупки
@@ -235,6 +270,11 @@ func (a *App) setupRoutes() {
 	a.router.Handle("DELETE "+apiPrefix+"/cart", authMW(http.HandlerFunc(a.handleClearCart)))
 	a.router.Handle("POST "+apiPrefix+"/cart/checkout", authMW(http.HandlerFunc(a.handleCheckout)))
 	a.router.Handle("GET "+apiPrefix+"/orders", authMW(http.HandlerFunc(a.handleGetOrders)))
+
+	// Маршруты избранного (РК3)
+	a.router.Handle("GET "+apiPrefix+"/favorites", authMW(http.HandlerFunc(a.handleGetFavorites)))
+	a.router.Handle("POST "+apiPrefix+"/favorites/{adId}", authMW(http.HandlerFunc(a.handleAddFavorite)))
+	a.router.Handle("DELETE "+apiPrefix+"/favorites/{adId}", authMW(http.HandlerFunc(a.handleRemoveFavorite)))
 
 	// Раздача статики (картинки объявлений и аватарки)
 	fs := http.FileServer(http.Dir("static"))
@@ -427,6 +467,9 @@ func (a *App) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 	if a.services.Cart != nil {
 		user.CartCount = a.services.Cart.CountItems(userID)
 	}
+	if a.services.Favorites != nil {
+		user.FavoritesCount = a.services.Favorites.CountByUser(userID)
+	}
 
 	responser.RespondWithJSON(w, http.StatusOK, user)
 }
@@ -604,7 +647,29 @@ func (a *App) handleGetPublicProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleGetAds(w http.ResponseWriter, r *http.Request) {
-	adsList := a.services.Ads.GetAll()
+	q := r.URL.Query()
+	filter := models.AdFilter{
+		Query:    strings.TrimSpace(q.Get("q")),
+		Location: strings.TrimSpace(q.Get("location")),
+		Sort:     strings.TrimSpace(q.Get("sort")),
+	}
+	if catStr := q.Get("category_id"); catStr != "" {
+		if catID, err := strconv.ParseInt(catStr, 10, 64); err == nil && catID > 0 {
+			filter.CategoryID = catID
+		}
+	}
+	if minStr := q.Get("min_price"); minStr != "" {
+		if minVal, err := strconv.ParseInt(minStr, 10, 64); err == nil && minVal >= 0 {
+			filter.MinPrice = &minVal
+		}
+	}
+	if maxStr := q.Get("max_price"); maxStr != "" {
+		if maxVal, err := strconv.ParseInt(maxStr, 10, 64); err == nil && maxVal >= 0 {
+			filter.MaxPrice = &maxVal
+		}
+	}
+
+	adsList := a.services.Ads.Search(filter)
 	responser.RespondWithJSON(w, http.StatusOK, adsList)
 }
 

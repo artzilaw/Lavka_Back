@@ -13,6 +13,8 @@ type Config struct {
 	Env             string
 	StoragePath     string
 	DatabaseURL     string
+	AuthGRPCAddr    string
+	CatalogGRPCAddr string
 	TokenTTL        time.Duration
 	HTTP            HTTPConfig
 	CleanupInterval time.Duration
@@ -66,6 +68,8 @@ func MustLoadByPath(path string) *Config {
 		Env:             rawConfig.Env,
 		StoragePath:     rawConfig.StoragePath,
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		AuthGRPCAddr:    os.Getenv("AUTH_GRPC_ADDR"),
+		CatalogGRPCAddr: os.Getenv("CATALOG_GRPC_ADDR"),
 		TokenTTL:        parseDuration(rawConfig.TokenTTL, "token_ttl"),
 		HTTP:            rawConfig.HTTP,
 		CleanupInterval: parseDuration(rawConfig.CleanupInterval, "cleanup_interval"),

@@ -69,12 +69,22 @@ func TestAdsRepository_SQLMock(t *testing.T) {
 
 	repo := NewAdsRepository(db, testLogger())
 	now := time.Now()
-	adCols := []string{"id", "seller_id", "category_id", "title", "description", "price", "status", "location", "views_count", "favorites_count", "created_at", "updated_at", "deleted_at"}
+	adCols := []string{
+		"id", "seller_id", "category_id", "title", "description", "price", "status", "location",
+		"views_count", "favorites_count", "promotion_tier", "promotion_priority", "promoted_until",
+		"created_at", "updated_at", "deleted_at",
+	}
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO ads (seller_id, category_id, title, description, price, status, location) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, seller_id, category_id, title, description, price, status, location, views_count, favorites_count, created_at, updated_at, deleted_at`)).
+	mock.ExpectQuery(`INSERT INTO ads`).
 		WithArgs(int64(3), int64(1), "iPhone 15", "Хорошее состояние", int64(70000), models.AdStatusActive, "Москва").
-		WillReturnRows(sqlmock.NewRows(adCols).AddRow(int64(10), int64(3), int64(1), "iPhone 15", "Хорошее состояние", int64(70000), "active", "Москва", int64(0), int64(0), now, now, nil))
+		WillReturnRows(sqlmock.NewRows(adCols).AddRow(
+			int64(10), int64(3), int64(1), "iPhone 15", "Хорошее состояние", int64(70000), "active", "Москва",
+			int64(0), int64(0), "", 0, nil, now, now, nil,
+		))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO ad_price_history (ad_id, old_price, new_price) VALUES ($1, $2, $3)`)).
+		WithArgs(int64(10), int64(70000), int64(70000)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO ad_photos (ad_id, url, position) VALUES ($1, $2, $3)`)).
 		WithArgs(int64(10), "/static/img/ads/test.jpg", 0).
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -151,6 +161,60 @@ func TestCartRepository_SQLMock(t *testing.T) {
 	})
 	if err != nil || order.ID != 1 {
 		t.Fatalf("CreateOrder = (%+v, %v)", order, err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestWalletRepository_SQLMock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New error: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewWalletRepository(db, testLogger())
+	now := time.Now()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT balance FROM users WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"balance"}).AddRow(int64(1000)))
+	bal, err := repo.GetBalance(1)
+	if err != nil || bal != 1000 {
+		t.Fatalf("GetBalance = (%d, %v)", bal, err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2 RETURNING balance`)).
+		WithArgs(int64(500), int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"balance"}).AddRow(int64(1500)))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO wallet_transactions (user_id, amount, type, description) VALUES ($1, $2, 'topup', $3) RETURNING id, user_id, amount, type, description, created_at`)).
+		WithArgs(int64(1), int64(500), "TopUp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "amount", "type", "description", "created_at"}).AddRow(int64(1), int64(1), int64(500), "topup", "TopUp", now))
+	mock.ExpectCommit()
+
+	newBal, tx, err := repo.TopUp(1, 500, "TopUp")
+	if err != nil || newBal != 1500 || tx.ID != 1 {
+		t.Fatalf("TopUp = (%d, %+v, %v)", newBal, tx, err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT balance FROM users WHERE id = $1 FOR UPDATE`)).
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"balance"}).AddRow(int64(1500)))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET balance = $1, updated_at = NOW() WHERE id = $2`)).
+		WithArgs(int64(901), int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO wallet_transactions (user_id, amount, type, description) VALUES ($1, $2, 'promotion', $3) RETURNING id, user_id, amount, type, description, created_at`)).
+		WithArgs(int64(1), int64(-599), "VIP").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "amount", "type", "description", "created_at"}).AddRow(int64(2), int64(1), int64(-599), "promotion", "VIP", now))
+	mock.ExpectCommit()
+
+	afterBal, tx2, err := repo.Charge(1, 599, "VIP")
+	if err != nil || afterBal != 901 || tx2.Amount != -599 {
+		t.Fatalf("Charge = (%d, %+v, %v)", afterBal, tx2, err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
