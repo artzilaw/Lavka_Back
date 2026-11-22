@@ -15,10 +15,27 @@ import (
 
 	"lavka/internal/app/http/middleware"
 	"lavka/internal/domain/models"
+	"lavka/internal/pkg/jwt"
 	"lavka/internal/pkg/responser"
 	"lavka/internal/pkg/validator"
 	"lavka/internal/storage/ads"
+
+	jwtlib "github.com/golang-jwt/jwt/v5"
 )
+
+var categoryNames = map[int64]string{
+	1:  "Электроника",
+	2:  "Авто и гаражи",
+	3:  "Недвижимость",
+	4:  "Одежда и обувь",
+	5:  "Хобби и отдых",
+	6:  "Для дома",
+	7:  "Работа",
+	8:  "Животные",
+	9:  "Запчасти",
+	10: "Детям",
+	11: "Красота",
+}
 
 var allowedAdPhotoTypes = map[string]string{
 	"image/jpeg": ".jpg",
@@ -47,7 +64,43 @@ type AdValidationErrors struct {
 
 type AdDetailResponse struct {
 	models.Ad
-	Seller *PublicUserResponse `json:"seller,omitempty"`
+	CategoryName string                    `json:"category_name,omitempty"`
+	PriceHistory []models.PriceHistoryItem `json:"price_history,omitempty"`
+	Seller       *PublicUserResponse       `json:"seller,omitempty"`
+}
+
+func (r AdDetailResponse) MarshalJSON() ([]byte, error) {
+	type adAlias models.Ad
+	return json.Marshal(struct {
+		adAlias
+		CategoryName string                    `json:"category_name,omitempty"`
+		PriceHistory []models.PriceHistoryItem `json:"price_history,omitempty"`
+		Seller       *PublicUserResponse       `json:"seller,omitempty"`
+	}{
+		adAlias:      adAlias(r.Ad),
+		CategoryName: r.CategoryName,
+		PriceHistory: r.PriceHistory,
+		Seller:       r.Seller,
+	})
+}
+
+func (r *AdDetailResponse) UnmarshalJSON(data []byte) error {
+	type adAlias models.Ad
+	aux := struct {
+		*adAlias
+		CategoryName string                    `json:"category_name,omitempty"`
+		PriceHistory []models.PriceHistoryItem `json:"price_history,omitempty"`
+		Seller       *PublicUserResponse       `json:"seller,omitempty"`
+	}{
+		adAlias: (*adAlias)(&r.Ad),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.CategoryName = aux.CategoryName
+	r.PriceHistory = aux.PriceHistory
+	r.Seller = aux.Seller
+	return nil
 }
 
 func validateAdRequest(req *AdUpsertRequest) AdValidationErrors {
@@ -101,6 +154,25 @@ func (a *App) buildPublicSeller(r *http.Request, sellerID int64) *PublicUserResp
 	}
 }
 
+func (a *App) extractOptionalUserID(r *http.Request) int64 {
+	cookie, err := r.Cookie("token")
+	if err != nil || cookie.Value == "" {
+		return 0
+	}
+	tok, err := jwt.ParseToken(cookie.Value, a.secret)
+	if err != nil || !tok.Valid {
+		return 0
+	}
+	claims, ok := tok.Claims.(jwtlib.MapClaims)
+	if !ok {
+		return 0
+	}
+	if uid, ok := claims["uid"].(float64); ok {
+		return int64(uid)
+	}
+	return 0
+}
+
 func (a *App) handleGetAdByID(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -108,7 +180,7 @@ func (a *App) handleGetAdByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ad, err := a.services.Ads.IncrementViews(id)
+	ad, err := a.services.Ads.GetByID(id)
 	if err != nil {
 		if errors.Is(err, ads.ErrAdNotFound) {
 			responser.RespondWithError(w, http.StatusNotFound, "ad not found")
@@ -119,10 +191,30 @@ func (a *App) handleGetAdByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	trackView := r.URL.Query().Get("track_view") != "false"
+	if trackView {
+		viewerID := a.extractOptionalUserID(r)
+		// Не засчитываем просмотр от самого продавца
+		if viewerID == 0 || viewerID != ad.SellerID {
+			viewerKey := "ip:" + clientIPFromRequest(r)
+			if viewerID > 0 {
+				viewerKey = fmt.Sprintf("u:%d", viewerID)
+			}
+			if a.viewTracker == nil || a.viewTracker.shouldCount(viewerKey, ad.ID) {
+				if updated, incErr := a.services.Ads.IncrementViews(id); incErr == nil {
+					ad = updated
+				}
+			}
+		}
+	}
+
 	seller := a.buildPublicSeller(r, ad.SellerID)
+	priceHistory := a.services.Ads.GetPriceHistory(ad.ID)
 	responser.RespondWithJSON(w, http.StatusOK, AdDetailResponse{
-		Ad:     ad,
-		Seller: seller,
+		Ad:           ad,
+		CategoryName: categoryNames[ad.CategoryID],
+		PriceHistory: priceHistory,
+		Seller:       seller,
 	})
 }
 

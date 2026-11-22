@@ -6,10 +6,13 @@ import (
 	"net/http"
 
 	"lavka/internal/pkg/responser"
-	"lavka/internal/storage/blacklist"
 
 	"github.com/golang-jwt/jwt/v5"
 )
+
+type TokenChecker interface {
+	Check(jti string) bool
+}
 
 type contextKey string
 
@@ -26,7 +29,7 @@ var (
 	ErrInvalidUidClaim    = "invalid uid claim"
 )
 
-func AuthMiddleware(log *slog.Logger, bl *blacklist.InMemory, secret string) func(http.Handler) http.Handler {
+func AuthMiddleware(log *slog.Logger, bl TokenChecker, secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookie, err := r.Cookie("token")

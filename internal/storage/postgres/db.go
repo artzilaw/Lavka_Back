@@ -30,7 +30,34 @@ func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("postgres.Open ping: %w", err)
 	}
 
+	_ = ensureRK4Schema(pingCtx, db)
+
 	return db, nil
+}
+
+func ensureRK4Schema(ctx context.Context, db *sql.DB) error {
+	const ddl = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS balance BIGINT NOT NULL DEFAULT 1000;
+ALTER TABLE ads ADD COLUMN IF NOT EXISTS promotion_tier VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE ads ADD COLUMN IF NOT EXISTS promotion_priority INT NOT NULL DEFAULT 0;
+ALTER TABLE ads ADD COLUMN IF NOT EXISTS promoted_until TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS ad_price_history (
+    id BIGSERIAL PRIMARY KEY,
+    ad_id BIGINT NOT NULL REFERENCES ads(id) ON DELETE CASCADE,
+    old_price BIGINT NOT NULL,
+    new_price BIGINT NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount BIGINT NOT NULL,
+    type VARCHAR(32) NOT NULL CHECK (type IN ('topup', 'promotion')),
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
+	_, err := db.ExecContext(ctx, ddl)
+	return err
 }
 
 func isUniqueViolation(err error) bool {

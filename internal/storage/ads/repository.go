@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,10 +20,12 @@ var (
 )
 
 type AdsRepository struct {
-	mu     sync.RWMutex
-	Data   []models.Ad
-	nextID int64
-	path   string
+	mu           sync.RWMutex
+	Data         []models.Ad
+	priceHistory map[int64][]models.PriceHistoryItem
+	nextID       int64
+	nextHistID   int64
+	path         string
 }
 
 type adsDump struct {
@@ -32,14 +36,28 @@ type adsDump struct {
 func NewAdsRepository() *AdsRepository {
 	initial := generateMockAds()
 	var maxID int64
+	hist := make(map[int64][]models.PriceHistoryItem, len(initial))
+	var histID int64
 	for _, a := range initial {
 		if a.ID > maxID {
 			maxID = a.ID
 		}
+		histID++
+		hist[a.ID] = []models.PriceHistoryItem{
+			{
+				ID:        histID,
+				AdID:      a.ID,
+				OldPrice:  a.Price,
+				NewPrice:  a.Price,
+				ChangedAt: a.CreatedAt,
+			},
+		}
 	}
 	return &AdsRepository{
-		Data:   initial,
-		nextID: maxID,
+		Data:         initial,
+		priceHistory: hist,
+		nextID:       maxID,
+		nextHistID:   histID,
 	}
 }
 
@@ -132,16 +150,69 @@ func cloneAd(ad models.Ad) models.Ad {
 	return ad
 }
 
+func effectivePromoPriority(ad models.Ad, now time.Time) int {
+	if ad.PromotionPriority > 0 && ad.PromotedUntil != nil && ad.PromotedUntil.After(now) {
+		return ad.PromotionPriority
+	}
+	return 0
+}
+
 func (r *AdsRepository) GetAll() []models.Ad {
+	return r.Search(models.AdFilter{})
+}
+
+func (r *AdsRepository) Search(filter models.AdFilter) []models.Ad {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	q := strings.ToLower(strings.TrimSpace(filter.Query))
+	loc := strings.ToLower(strings.TrimSpace(filter.Location))
+
 	result := make([]models.Ad, 0, len(r.Data))
 	for _, ad := range r.Data {
-		if ad.Status == models.AdStatusActive {
-			result = append(result, cloneAd(ad))
+		if ad.Status != models.AdStatusActive {
+			continue
 		}
+		if filter.CategoryID > 0 && ad.CategoryID != filter.CategoryID {
+			continue
+		}
+		if loc != "" && !strings.Contains(strings.ToLower(ad.Location), loc) {
+			continue
+		}
+		if filter.MinPrice != nil && ad.Price < *filter.MinPrice {
+			continue
+		}
+		if filter.MaxPrice != nil && ad.Price > *filter.MaxPrice {
+			continue
+		}
+		if q != "" {
+			haystack := strings.ToLower(ad.Title + " " + ad.Description + " " + ad.Location)
+			if !strings.Contains(haystack, q) {
+				continue
+			}
+		}
+		result = append(result, cloneAd(ad))
 	}
+
+	now := time.Now()
+	switch filter.Sort {
+	case "price_asc":
+		sort.SliceStable(result, func(i, j int) bool { return result[i].Price < result[j].Price })
+	case "price_desc":
+		sort.SliceStable(result, func(i, j int) bool { return result[i].Price > result[j].Price })
+	case "popular":
+		sort.SliceStable(result, func(i, j int) bool { return result[i].ViewsCount > result[j].ViewsCount })
+	default:
+		sort.SliceStable(result, func(i, j int) bool {
+			pi := effectivePromoPriority(result[i], now)
+			pj := effectivePromoPriority(result[j], now)
+			if pi != pj {
+				return pi > pj
+			}
+			return result[i].CreatedAt.After(result[j].CreatedAt)
+		})
+	}
+
 	return result
 }
 
@@ -222,6 +293,19 @@ func (r *AdsRepository) Create(ad models.Ad) (models.Ad, error) {
 	}
 
 	r.Data = append([]models.Ad{cloneAd(ad)}, r.Data...)
+	if r.priceHistory == nil {
+		r.priceHistory = make(map[int64][]models.PriceHistoryItem)
+	}
+	r.nextHistID++
+	r.priceHistory[ad.ID] = []models.PriceHistoryItem{
+		{
+			ID:        r.nextHistID,
+			AdID:      ad.ID,
+			OldPrice:  ad.Price,
+			NewPrice:  ad.Price,
+			ChangedAt: now,
+		},
+	}
 	if err := r.persist(); err != nil {
 		return models.Ad{}, err
 	}
@@ -237,6 +321,7 @@ func (r *AdsRepository) Update(id int64, sellerID int64, patch models.Ad) (model
 			if r.Data[i].SellerID != sellerID {
 				return models.Ad{}, ErrForbidden
 			}
+			oldPrice := r.Data[i].Price
 			r.Data[i].Title = patch.Title
 			r.Data[i].Description = patch.Description
 			r.Data[i].Price = patch.Price
@@ -247,7 +332,21 @@ func (r *AdsRepository) Update(id int64, sellerID int64, patch models.Ad) (model
 				copy(photos, patch.Photos)
 				r.Data[i].Photos = photos
 			}
-			r.Data[i].UpdatedAt = time.Now()
+			now := time.Now()
+			r.Data[i].UpdatedAt = now
+			if oldPrice != patch.Price {
+				if r.priceHistory == nil {
+					r.priceHistory = make(map[int64][]models.PriceHistoryItem)
+				}
+				r.nextHistID++
+				r.priceHistory[id] = append(r.priceHistory[id], models.PriceHistoryItem{
+					ID:        r.nextHistID,
+					AdID:      id,
+					OldPrice:  oldPrice,
+					NewPrice:  patch.Price,
+					ChangedAt: now,
+				})
+			}
 			if err := r.persist(); err != nil {
 				return models.Ad{}, err
 			}
@@ -339,6 +438,39 @@ func (r *AdsRepository) Delete(id int64, sellerID int64) error {
 		}
 	}
 	return ErrAdNotFound
+}
+
+func (r *AdsRepository) GetPriceHistory(adID int64) []models.PriceHistoryItem {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	src := r.priceHistory[adID]
+	out := make([]models.PriceHistoryItem, len(src))
+	copy(out, src)
+	return out
+}
+
+func (r *AdsRepository) Promote(id int64, sellerID int64, tier string, priority int, until time.Time) (models.Ad, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := range r.Data {
+		if r.Data[i].ID == id && r.Data[i].Status != models.AdStatusDeleted {
+			if r.Data[i].SellerID != sellerID {
+				return models.Ad{}, ErrForbidden
+			}
+			u := until
+			r.Data[i].PromotionTier = tier
+			r.Data[i].PromotionPriority = priority
+			r.Data[i].PromotedUntil = &u
+			r.Data[i].UpdatedAt = time.Now()
+			if err := r.persist(); err != nil {
+				return models.Ad{}, err
+			}
+			return cloneAd(r.Data[i]), nil
+		}
+	}
+	return models.Ad{}, ErrAdNotFound
 }
 
 func generateMockAds() []models.Ad {

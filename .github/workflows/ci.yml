@@ -1,0 +1,40 @@
+name: Lavka Backend CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test-and-build:
+    name: Vet, Test (Coverage >= 60%) & Build Microservices
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests with coverage (excluding generated easyjson/mocks)
+        run: |
+          go test -race -coverpkg=./internal/... -coverprofile=coverage.raw.out ./internal/...
+          grep -v -E '(_easyjson\.go|mock_.*\.go)' coverage.raw.out > coverage.out
+          go tool cover -func=coverage.out | tail -n 1
+
+      - name: Build all 3 microservices
+        run: |
+          go build -o bin/lavka-server ./cmd/server
+          go build -o bin/lavka-auth ./cmd/auth-service
+          go build -o bin/lavka-catalog ./cmd/catalog-service

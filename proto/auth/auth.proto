@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package lavka.auth.v1;
+
+option go_package = "lavka/internal/grpc/authservice;authservice";
+
+service AuthService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc ValidateTokenAndGetUser(ValidateTokenRequest) returns (UserResponse);
+  rpc Logout(LogoutRequest) returns (EmptyResponse);
+  rpc IsTokenRevoked(IsTokenRevokedRequest) returns (IsTokenRevokedResponse);
+  rpc GetProfile(GetProfileRequest) returns (UserResponse);
+  rpc UpdateProfile(UpdateProfileRequest) returns (UserResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (EmptyResponse);
+  rpc UpdateAvatar(UpdateAvatarRequest) returns (UserResponse);
+}
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+  string name = 3;
+}
+
+message RegisterResponse {
+  int64 user_id = 1;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string token = 1;
+  User user = 2;
+}
+
+message ValidateTokenRequest {
+  string token = 1;
+}
+
+message LogoutRequest {
+  string jti = 1;
+  int64 exp_unix = 2;
+}
+
+message IsTokenRevokedRequest {
+  string jti = 1;
+}
+
+message IsTokenRevokedResponse {
+  bool revoked = 1;
+}
+
+message GetProfileRequest {
+  int64 user_id = 1;
+}
+
+message UpdateProfileRequest {
+  int64 user_id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message ChangePasswordRequest {
+  int64 user_id = 1;
+  string current_password = 2;
+  string new_password = 3;
+}
+
+message UpdateAvatarRequest {
+  int64 user_id = 1;
+  bytes file_data = 2;
+  string filename = 3;
+}
+
+message UserResponse {
+  User user = 1;
+}
+
+message EmptyResponse {}
+
+message User {
+  int64 id = 1;
+  string name = 2;
+  string email = 3;
+  string avatar_path = 4;
+  double rating = 5;
+  int32 reviews_count = 6;
+  int32 ads_count = 7;
+  int32 favorites_count = 8;
+  int32 cart_count = 9;
+  bool is_admin = 10;
+  string created_at = 11;
+  string updated_at = 12;
+}

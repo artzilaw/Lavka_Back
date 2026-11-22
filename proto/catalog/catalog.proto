@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package lavka.catalog.v1;
+
+option go_package = "lavka/internal/grpc/catalogservice;catalogservice";
+
+service CatalogService {
+  rpc GetAllAds(EmptyRequest) returns (AdsListResponse);
+  rpc SearchAds(SearchAdsRequest) returns (AdsListResponse);
+  rpc GetAdByID(AdIDRequest) returns (AdResponse);
+  rpc IncrementViews(AdIDRequest) returns (AdResponse);
+  rpc GetAdsBySeller(SellerAdsRequest) returns (AdsListResponse);
+  rpc CountAdsBySeller(SellerIDRequest) returns (SellerAdsCountResponse);
+  rpc CreateAd(CreateAdRequest) returns (AdResponse);
+  rpc UpdateAd(UpdateAdRequest) returns (AdResponse);
+  rpc CloseAd(SellerAdActionRequest) returns (AdResponse);
+  rpc ReopenAd(SellerAdActionRequest) returns (AdResponse);
+  rpc MarkSold(MarkSoldRequest) returns (EmptyResponse);
+  rpc DeleteAd(SellerAdActionRequest) returns (EmptyResponse);
+
+  rpc AddFavorite(FavoriteRequest) returns (FavoriteCountResponse);
+  rpc RemoveFavorite(FavoriteRequest) returns (FavoriteCountResponse);
+  rpc ListFavoriteAdIDs(UserIDRequest) returns (FavoriteIDsResponse);
+  rpc CountFavoritesByUser(UserIDRequest) returns (FavoriteCountResponse);
+}
+
+message EmptyRequest {}
+message EmptyResponse {}
+
+message AdIDRequest {
+  int64 id = 1;
+}
+
+message SellerIDRequest {
+  int64 seller_id = 1;
+}
+
+message UserIDRequest {
+  int64 user_id = 1;
+}
+
+message SellerAdsRequest {
+  int64 seller_id = 1;
+  bool include_closed = 2;
+}
+
+message SellerAdsCountResponse {
+  int32 active = 1;
+  int32 closed = 2;
+}
+
+message SearchAdsRequest {
+  string query = 1;
+  int64 category_id = 2;
+  string location = 3;
+  optional int64 min_price = 4;
+  optional int64 max_price = 5;
+  string sort = 6;
+}
+
+message CreateAdRequest {
+  Ad ad = 1;
+}
+
+message UpdateAdRequest {
+  int64 id = 1;
+  int64 seller_id = 2;
+  Ad patch = 3;
+}
+
+message SellerAdActionRequest {
+  int64 id = 1;
+  int64 seller_id = 2;
+}
+
+message MarkSoldRequest {
+  repeated int64 ids = 1;
+}
+
+message FavoriteRequest {
+  int64 user_id = 1;
+  int64 ad_id = 2;
+}
+
+message FavoriteCountResponse {
+  int64 count = 1;
+}
+
+message FavoriteIDsResponse {
+  repeated int64 ad_ids = 1;
+}
+
+message AdResponse {
+  Ad ad = 1;
+}
+
+message AdsListResponse {
+  repeated Ad ads = 1;
+}
+
+message Ad {
+  int64 id = 1;
+  int64 seller_id = 2;
+  int64 category_id = 3;
+  string title = 4;
+  string description = 5;
+  int64 price = 6;
+  string status = 7;
+  int64 views_count = 8;
+  int64 favorites_count = 9;
+  repeated string photos = 10;
+  string location = 11;
+  string created_at = 12;
+  string updated_at = 13;
+}
